@@ -117,8 +117,9 @@ ms = ct.default_ms("observation.ms")         # full MS + 17 subtables
 ```
 Also available: `taql` `CREATE TABLE`, `getcell`/`putcell`, `getvarcol`/
 `putvarcol`, `getcolslice`/`putcolslice`, `getkeywords`/`putkeywords`,
-`addcols`, `addrows`, `required_ms_desc`/`complete_ms_desc`,
-`default_ms_subtable`, `tablefromascii`.
+`info`/`putinfo`/`addreadmeline` (the `table.info` marker), `addcols`,
+`addrows`, `required_ms_desc`/`complete_ms_desc`, `default_ms_subtable`,
+`tablefromascii`.
 
 ### Units and quantities
 

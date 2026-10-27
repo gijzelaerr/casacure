@@ -5,6 +5,34 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every table now gets a `table.info` on creation, and the Python `table`
+  grows `info()` / `putinfo()` / `addreadmeline()`** (issue #23).  casacore
+  writes a `table.info` into every table directory it creates — a plain
+  table `Type = \nSubType = \n\n`, a Measurement Set's main table
+  `Type = Measurement Set` plus the MS readme — and consumers branch on it:
+  python-casacore reading a casacure-written MS reported
+  `{'type': '', …}` where casacore's own output says `Measurement Set`.
+  The file is now written by `create_table` (the plain default; a rewrite
+  of an existing table keeps the marker its creator wrote, like the
+  in-place regeneration already kept it), `default_ms` sets the MS type
+  and readme on the main table (the subtables stay plain), and the image
+  path's writer shares the same serialiser (its bytes are unchanged).
+  The file is byte-exact casacore — probed against python-casacore 3.8.1
+  and the casacore-written golden fixtures (`PARENT.tab`, disko's
+  `test.ms`): a table directory copied between backends diffs empty on
+  `table.info`, and each backend reads what the other wrote.  `info()`
+  reads the file (a missing file reads as empty strings, like casacore,
+  and is not recreated by open/close); `putinfo(dict)` merges — fields
+  absent from the dict keep their value, the readme is stored as whole
+  lines (a missing trailing newline is appended), and unknown fields raise
+  python-casacore's `Name of field X must be type, subType or readme`;
+  `addreadmeline(line)` appends a readme line.  A read-only handle refuses
+  `putinfo`/`addreadmeline` like every other write.  Tests:
+  `crates/casacure/tests/table_info.rs`, `tests/test_table_info.py`
+  (incl. real python-casacore round-trips in both directions).
+
 ## [3.8.36] - 2026-11-02
 
 ### Fixed

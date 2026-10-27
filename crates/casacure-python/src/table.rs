@@ -1540,6 +1540,94 @@ impl Table {
         Ok(d.into_any().unbind())
     }
 
+    /// `info()` -> dict `{'type', 'subType', 'readme'}` — the table's
+    /// `table.info` file (casacore `Table::info()`). A table without the
+    /// file (written before casacure created it, or deleted afterwards)
+    /// reads as empty strings, like casacore.
+    fn info(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let dir = self.dir_of();
+        let info = core::tableinfo::TableInfo::read(&dir).map_err(err)?;
+        let d = PyDict::new(py);
+        d.set_item("type", info.r#type)?;
+        d.set_item("subType", info.sub_type)?;
+        d.set_item("readme", info.readme)?;
+        Ok(d.into_any().unbind())
+    }
+
+    /// `putinfo(dict)` — set any of `type`, `subType`, `readme` on the
+    /// table's `table.info` (casacore `TableProxy::putinfo`, probed against
+    /// python-casacore 3.8.1): fields absent from the dict keep their
+    /// value, the readme is stored as whole lines (a missing trailing
+    /// newline is appended), and an unknown field is the casacore
+    /// `RuntimeError` naming the accepted keys.
+    fn putinfo(&self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let dict = value.cast::<PyDict>().map_err(|_| {
+            PyTypeError::new_err("putinfo takes a dict with the fields type, subType, readme")
+        })?;
+        // Validate the whole dict before touching anything (casacore
+        // converts the record first, so a bad shape fails even on a
+        // read-only table).
+        let mut new_type: Option<String> = None;
+        let mut new_sub_type: Option<String> = None;
+        let mut new_readme: Option<String> = None;
+        for (k, v) in dict.iter() {
+            let key = k.extract::<String>()?;
+            let target = match key.as_str() {
+                "type" => &mut new_type,
+                "subType" => &mut new_sub_type,
+                "readme" => &mut new_readme,
+                other => {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "Name of field {other} must be type, subType or readme"
+                    )))
+                }
+            };
+            *target = Some(v.extract().map_err(|_| {
+                PyRuntimeError::new_err(format!(
+                    "RecordRep::get_pointer - field {key} must be a string"
+                ))
+            })?);
+        }
+        let dir = self.dir_of();
+        let inner = self.inner.lock().unwrap();
+        match &*inner {
+            Inner::Write { .. } => {
+                // table.info is metadata beside the data files (like the
+                // keywords' table.dat home, but a plain text file): write
+                // it through, no cell flush involved.
+                let mut info = core::tableinfo::TableInfo::read(&dir).map_err(err)?;
+                if let Some(t) = new_type {
+                    info.r#type = t;
+                }
+                if let Some(s) = new_sub_type {
+                    info.sub_type = s;
+                }
+                if let Some(r) = new_readme {
+                    info.readme = r;
+                }
+                info.write(&dir).map_err(err)?;
+                Ok(())
+            }
+            _ => Err(not_writable(self.view)),
+        }
+    }
+
+    /// `addreadmeline(line)` — append a line to the table info's readme.
+    fn addreadmeline(&self, line: &str) -> PyResult<()> {
+        let dir = self.dir_of();
+        let inner = self.inner.lock().unwrap();
+        match &*inner {
+            Inner::Write { .. } => {
+                let mut info = core::tableinfo::TableInfo::read(&dir).map_err(err)?;
+                info.readme.push_str(line);
+                info.readme.push('\n');
+                info.write(&dir).map_err(err)?;
+                Ok(())
+            }
+            _ => Err(not_writable(self.view)),
+        }
+    }
+
     /// `getdminfo()` -> dict.
     fn getdminfo(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.lock().unwrap();

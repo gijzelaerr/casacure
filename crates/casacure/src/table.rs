@@ -521,6 +521,15 @@ pub fn create_table(
         crate::datafile::write_atomic(&f_path, &file)?;
         written.push(f_path);
     }
+    // Every casacore table directory carries a `table.info` (casacore's
+    // TableInfo — issue #23): create the plain default when the directory
+    // does not have one. A regeneration of an existing table keeps the
+    // file it already has — the marker belongs to the table's creator
+    // (an MS's `Type = Measurement Set`), not to this rewrite.
+    let info_path = table_dir.join("table.info");
+    if !info_path.exists() {
+        crate::tableinfo::TableInfo::default().write(table_dir)?;
+    }
     // Every casacore table carries a `table.lock` — the fcntl target of the
     // locking protocol (a byte-level directory copy without one simply
     // operates lock-free, like casacore's `mustExist=False`). Create it
