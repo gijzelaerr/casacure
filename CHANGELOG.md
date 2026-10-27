@@ -32,6 +32,22 @@ subtasks are moved here.
   `putinfo`/`addreadmeline` like every other write.  Tests:
   `crates/casacure/tests/table_info.rs`, `tests/test_table_info.py`
   (incl. real python-casacore round-trips in both directions).
+- **The test-suite is hermetic: it never fetches IERS data over the
+  network** (`tests/conftest.py`).  The century grid in
+  `tests/test_measures.py` asks astropy for `AltAz` epochs beyond its
+  bundled IERS predictive range, which triggers `iers.conf.auto_download`
+  (`auto_max_age = 30` days): on a host where that fetch stalls — a
+  read-only `~/.astropy/cache`, the primary URL answering 400 and the
+  mirror streaming 3.7 MB in 23 s or never answering — the suite wedged in
+  `ssl.read` at zero CPU with no timeout (observed: 35 minutes inside
+  `test_azel_matches_astropy_over_a_century`, while the suite itself takes
+  88 s).  `pytest_configure` now sets `auto_max_age = None` (→ `float.max`,
+  which gates both `_refresh_table_as_needed` *and* the staleness error
+  that would otherwise be raised in its place) and a 20 s socket timeout,
+  so the reference stays the installed `astropy-iers-data` release — what
+  MEASURES_ACCURACY.md documents the contract against.  Unchanged
+  otherwise: 505 passed / 37 skipped / 3 xfailed, century grid worst
+  0.026″ (the documented figure).
 
 ## [3.8.36] - 2026-11-02
 

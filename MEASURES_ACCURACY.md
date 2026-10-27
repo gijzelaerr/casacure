@@ -68,7 +68,11 @@ casacure compiles its data in:
   2026-10-05 and 2026-10-19 releases).  Past the series end (MJD 61547) the
   contract test therefore hands astropy casacure's constant
   (`Time.delta_ut1_utc`), so it compares the transforms rather than two
-  extrapolations of the Earth's rotation.
+  extrapolations of the Earth's rotation.  Runs never refresh that data
+  over the network: `tests/conftest.py` disables astropy's IERS
+  auto-download, so a run always compares against whichever
+  `astropy-iers-data` release is installed — and a stalled IERS fetch can
+  no longer wedge the suite inside `ssl.read`.
   Note that UTC itself only exists from 1960 and no `UT1−UTC` observation
   reaches back to 1926; the pre-1973 constants keep casacure and astropy in
   agreement where neither has data.
