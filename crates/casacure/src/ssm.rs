@@ -465,6 +465,26 @@ impl StandardStManFile {
     /// (independent of the data-file endianness) with the string data from
     /// byte 16; strings spanning buckets chain via `nextBucket`.
     fn read_long_string(&self, bucket: i32, offset: i32, length: u32) -> Result<String, SsmError> {
+        let bytes = self.read_string_bucket_bytes(bucket, offset, length)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Raw `length` bytes of string-bucket content starting at (`bucket`,
+    /// `offset`) — the byte-stream form of `SSMStringHandler::getData`
+    /// (SSMStringHandler.cc), used for scalar strings and for string-array
+    /// cell content alike. Content is addressed from byte 16 of the bucket
+    /// (the data area behind the canonical header) and limited by the
+    /// header's `usedLength`; once it reaches `usedLength` it continues in
+    /// `nextBucket` from that bucket's offset 0, because
+    /// `SSMStringHandler::putData` rolls an over-long write over into a
+    /// freshly chained bucket — so one payload may span any number of
+    /// buckets.
+    fn read_string_bucket_bytes(
+        &self,
+        bucket: i32,
+        offset: i32,
+        length: u32,
+    ) -> Result<Vec<u8>, SsmError> {
         if bucket < 0 || offset < 0 {
             return Err(SsmError::BadStringRef {
                 bucket,
@@ -512,7 +532,7 @@ impl StandardStManFile {
                 off = 0;
             }
         }
-        Ok(String::from_utf8_lossy(&out).into_owned())
+        Ok(out)
     }
 }
 
@@ -862,17 +882,17 @@ pub fn read_array_cell(
                 data: ArrayData::String(Vec::new()),
             }));
         }
-        let bucket_bytes = file.bucket_bytes(bucket as u32)?;
-        let start = 16 + off as usize;
-        let end = start + len as usize;
-        if end > bucket_bytes.len() {
-            return Err(SsmError::BadStringRef {
-                bucket,
-                offset: off,
-                length: len as u32,
-            });
-        }
-        let (logical, strings) = decode_string_array_content(&bucket_bytes[start..end])?;
+        // The content is a logical byte stream exactly like a scalar long
+        // string: `SSMStringHandler::put(Array<String>&)` writes it with
+        // `putData`, which rolls over into a chained bucket whenever it does
+        // not fit the current one (`getNewBucket(True)`), and `get`/`getShape`
+        // read it back through `getData` across that chain. Read it through
+        // the chain — slicing one bucket (as this did) rejected every cell
+        // whose content crossed a bucket boundary, e.g. a 146-byte
+        // CLI_COMMAND vector starting at offset 2724 of a full (used = 2800)
+        // 2816-byte bucket whose `nextBucket` holds the rest.
+        let content = file.read_string_bucket_bytes(bucket, off, len as u32)?;
+        let (logical, strings) = decode_string_array_content(&content)?;
         return Ok(RecordValue::Array(ArrayValue {
             shape: logical,
             data: ArrayData::String(strings),
@@ -2237,6 +2257,109 @@ mod tests {
                 .unwrap(),
             RecordValue::String(String::from_utf8(content.to_vec()).unwrap())
         );
+    }
+
+    /// Build a big-endian SSM file (256-byte buckets, 240-byte string data
+    /// area) whose single string-array column's row-0 cell is the 12-byte
+    /// reference (bucket 2, offset 220, `36 + extra`): the 36-byte content
+    /// has only 20 bytes of room left in bucket 2 (which is full, `used` =
+    /// 240), so it continues in chained bucket 3 exactly as casacore's
+    /// `SSMStringHandler::putData` lays such content out. Returns
+    /// `(file, content)`.
+    fn chained_string_array_file(extra: usize) -> (Vec<u8>, Vec<u8>) {
+        // `[ndim][CASA dims][filled flag][len-prefixed strings]` — the
+        // content `SSMStringHandler::put(Array<String>&, handleShape)` writes
+        // in canonical (big-endian) form.
+        let mut content = Vec::new();
+        content.extend_from_slice(&1i32.to_be_bytes()); // ndim
+        content.extend_from_slice(&2i32.to_be_bytes()); // CASA dim: vector of 2
+        content.extend_from_slice(&1i32.to_be_bytes()); // filled flag
+        content.extend_from_slice(&8i32.to_be_bytes());
+        content.extend_from_slice(b"cli-arg1");
+        content.extend_from_slice(&8i32.to_be_bytes());
+        content.extend_from_slice(b"cli-arg2");
+        assert_eq!(content.len(), 36);
+
+        let bucket_size = 256u32;
+        let data_len = bucket_size as usize - 16; // 240
+        let off = data_len - 20; // only 20 bytes of room left in bucket 2
+        let head = 20usize;
+
+        // Bucket 2: full (`used` = data area), chained to bucket 3, holding
+        // the content's first `head` bytes (the split lands mid-string).
+        let mut sb2 = vec![0u8; bucket_size as usize];
+        sb2[4..8].copy_from_slice(&(data_len as u32).to_be_bytes()); // used
+        sb2[8..12].copy_from_slice(&0u32.to_be_bytes()); // nDeleted
+        sb2[12..16].copy_from_slice(&3i32.to_be_bytes()); // next bucket
+        sb2[16 + off..16 + data_len].copy_from_slice(&content[..head]);
+        // Bucket 3: the content's tail, with no further continuation.
+        let mut sb3 = vec![0u8; bucket_size as usize];
+        let rest = &content[head..];
+        sb3[4..8].copy_from_slice(&(rest.len() as u32).to_be_bytes()); // used
+        sb3[8..12].copy_from_slice(&((data_len - rest.len()) as u32).to_be_bytes());
+        sb3[12..16].copy_from_slice(&(-1i32).to_be_bytes()); // next = -1
+        sb3[16..16 + rest.len()].copy_from_slice(rest);
+
+        // Row 0's cell reference (big-endian, like the file's header).
+        let mut data_bucket = [0u8; 256];
+        data_bucket[0..4].copy_from_slice(&2i32.to_be_bytes()); // bucket
+        data_bucket[4..8].copy_from_slice(&(off as i32).to_be_bytes());
+        data_bucket[8..12].copy_from_slice(&((content.len() + extra) as i32).to_be_bytes());
+
+        let mut file = build_file(bucket_size, &[&data_bucket], &index_payload(&[0], &[0]));
+        file.extend_from_slice(&sb2);
+        file.extend_from_slice(&sb3);
+        (file, content)
+    }
+
+    /// The variable-shape string-array descriptor of that file.
+    fn string_array_desc(name: &str) -> ColumnDesc {
+        let mut desc = scalar_desc(name, DataType::String, 0);
+        desc.ndim = 1;
+        desc.shape = Some(vec![2]);
+        desc.kind = ColumnKind::Array;
+        desc
+    }
+
+    #[test]
+    fn reads_string_array_content_chained_across_string_buckets() {
+        // Regression (MS HISTORY `CLI_COMMAND`, a `Vector<String>`): casacore
+        // writes a cell's string-bucket content with `SSMStringHandler::
+        // putData`, which rolls an over-long payload over into a chained
+        // bucket, and reads it back with `getData` across that chain. The
+        // HLTau HISTORY cell (bucket 59, offset 2724, length 146) sits in a
+        // full bucket (used = 2800, next = 60), so a single-bucket slice
+        // (`16 + off + len` = 2886 > 2816) failed with `BadStringRef`; the
+        // content really is 76 + 70 bytes across buckets 59 and 60.
+        let (file, _) = chained_string_array_file(0);
+        let f = parse(&file);
+        let s = spec(&[0]);
+        let desc = string_array_desc("SA");
+        assert_eq!(
+            read_array_cell(&f, &s, 0, &desc, 0).unwrap(),
+            RecordValue::Array(crate::record::ArrayValue {
+                shape: vec![2],
+                data: crate::record::ArrayData::String(vec![
+                    "cli-arg1".to_string(),
+                    "cli-arg2".to_string()
+                ]),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_string_array_reference_whose_chain_runs_dry() {
+        // The chained read still validates: a cell claiming 10 bytes more
+        // than the bucket chain holds fails with `BadStringRef` rather than
+        // returning truncated content.
+        let (file, _content) = chained_string_array_file(10);
+        let f = parse(&file);
+        let s = spec(&[0]);
+        let desc = string_array_desc("SA");
+        assert!(matches!(
+            read_array_cell(&f, &s, 0, &desc, 0),
+            Err(SsmError::BadStringRef { bucket: 3, .. })
+        ));
     }
 
     #[test]

@@ -6015,6 +6015,62 @@ mod tests {
             RecordValue::Int(1)
         );
     }
+
+    #[test]
+    fn create_table_with_chained_string_array_reads_back() {
+        use crate::record::{ArrayData, ArrayValue};
+        // A `Vector<String>` cell whose string-bucket content (12 + 2*(4+300)
+        // = 620 bytes) is larger than one string bucket's data area (512-16
+        // = 496): the writer must roll the payload over into a chained
+        // bucket (`SSMStringHandler::putData`) and the reader must follow
+        // that chain (`read_array_cell`), not slice a single bucket.
+        let mut desc = typed_desc();
+        desc.columns = vec![
+            array_col("SA", DataType::String, 0, vec![2]),
+            scalar_col("IDX", DataType::Int, 0),
+        ];
+        let long0 = "a".repeat(300);
+        let long1 = "b".repeat(300);
+        let value = RecordValue::Array(ArrayValue {
+            shape: vec![2],
+            data: ArrayData::String(vec![long0.clone(), long1.clone()]),
+        });
+        let values = vec![vec![value.clone()], vec![RecordValue::Int(7)]];
+        let dir = temp_dir("chainstrarr");
+        create_table(&dir, &desc, &values).unwrap();
+
+        let dat_bytes = std::fs::read(dir.join("table.dat")).unwrap();
+        let dat = parse_table_dat(&dat_bytes).unwrap();
+        let file = crate::ssm::StandardStManFile::open(&dir, 0, dat.header.big_endian).unwrap();
+        // rowsPerBucket * (12-byte string ref + Int) = 32 * 16.
+        assert_eq!(file.header.bucket_size, 512);
+        // Data + index + two chained string buckets (620 > 496).
+        assert_eq!(file.header.nr_buckets, 4, "data + index + 2 string buckets");
+        assert_eq!(
+            file.header.last_string_bucket, 3,
+            "the content must chain into a second string bucket"
+        );
+        let dm = &dat.column_set.data_managers[0];
+        let spec = match &dm.blob {
+            crate::columnset::DataManagerBlob::StandardStMan(s) => s,
+            _ => panic!("expected StandardStMan spec"),
+        };
+        let sa = dat.desc.column("SA").unwrap();
+        assert_eq!(
+            crate::ssm::read_array_cell(&file, spec, 0, sa, 0).unwrap(),
+            value,
+            "read back through the chained string buckets"
+        );
+        // And through the public getcol path.
+        let t = Table::open(&dir, true).unwrap();
+        let col = t
+            .colnames()
+            .iter()
+            .position(|n| n == "SA")
+            .expect("SA column");
+        assert_eq!(t.getcol(col, 0, 1).unwrap(), vec![value]);
+    }
+
     fn ism_col(name: &str, dt: DataType, option: i32) -> ColumnDesc {
         let mut d = scalar_col(name, dt, 0);
         d.data_manager_type = "IncrementalStMan".into();

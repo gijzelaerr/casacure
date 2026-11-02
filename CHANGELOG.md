@@ -16,6 +16,15 @@ subtasks are moved here.
   `"ISM"` blob (version-agnostic, with the old type-name fallback for
   unknown managers), which also lets `addcols` uniquify new managers
   against real names rather than the type.
+- **String-array columns whose content chains across string buckets read
+  correctly** (`SSMStringHandler::putData` splits over-long payloads across
+  buckets via `getNewBucket`, and `getData` reads them as a logical
+  stream). `getcol` on `Array<String>` columns — e.g. an MS
+  `HISTORY.CLI_COMMAND` — now follows `nextBucket` like the scalar path
+  already did; previously any cell with `16 + offset + length` beyond the
+  bucket size failed with `bad string reference: bucket N, offset O,
+  length L` (5 of 1432 rows in a real HLTau MS HISTORY table). The write
+  path already chained correctly.
 
 ## [3.8.35] - 2026-10-21
 
