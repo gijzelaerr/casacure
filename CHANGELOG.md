@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.36] - 2026-11-02
+
 ### Fixed
 
 - **`getdminfo()` reports the requested data-manager `NAME` for
