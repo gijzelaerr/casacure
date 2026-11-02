@@ -5335,19 +5335,21 @@ pub fn get_dminfo(
             other => DmSpec::Unsupported(other.to_string()),
         };
         // The manager name is the group/hypercolumn name: from the SSM spec
-        // blob for StandardStMan, from the TSM header's hypercolumn name
-        // otherwise (the TSM blob is empty).
+        // blob for StandardStMan, from the ISM spec blob for IncrementalStMan
+        // (`ISMBase::flush` stores the manager name casacore's
+        // `ColumnSet::dataManagerInfo` reports as `NAME`), and from the TSM
+        // header's hypercolumn name otherwise (the TSM blob is empty).
         let name = match &dm.blob {
             crate::columnset::DataManagerBlob::StandardStMan(s) => s.data_manager_name.clone(),
-            crate::columnset::DataManagerBlob::Unsupported(_) => {
-                if dm.type_name == "TiledColumnStMan" || dm.type_name == "TiledShapeStMan" {
-                    tsm_hypercolumn
-                        .clone()
-                        .unwrap_or_else(|| dm.type_name.clone())
-                } else {
-                    dm.type_name.clone()
+            crate::columnset::DataManagerBlob::Unsupported(raw) => match dm.type_name.as_str() {
+                "IncrementalStMan" => {
+                    crate::ism::parse_ism_name(raw).unwrap_or_else(|| dm.type_name.clone())
                 }
-            }
+                "TiledColumnStMan" | "TiledShapeStMan" => tsm_hypercolumn
+                    .clone()
+                    .unwrap_or_else(|| dm.type_name.clone()),
+                _ => dm.type_name.clone(),
+            },
         };
         n += 1;
         out.insert(

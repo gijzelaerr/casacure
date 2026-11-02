@@ -5,6 +5,18 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`getdminfo()` reports the requested data-manager `NAME` for
+  IncrementalStMan managers instead of the type name.** casacure persisted
+  the name into `table.dat` (the `"ISM"` blob `ISMBase::flush` writes) but
+  never parsed it back on read, so a manager requested as `IndexingGroup`
+  came back as `IncrementalStMan`, diverging from python-casacore and
+  breaking dask-ms's `test_ms_builder`. The name is now decoded from the
+  `"ISM"` blob (version-agnostic, with the old type-name fallback for
+  unknown managers), which also lets `addcols` uniquify new managers
+  against real names rather than the type.
+
 ## [3.8.35] - 2026-10-21
 
 ### Fixed

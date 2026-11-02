@@ -631,6 +631,21 @@ pub fn write_ism_blob(name: &str) -> Vec<u8> {
     w.into_bytes()
 }
 
+/// Decode the data-manager name an IncrementalStMan spec blob carries
+/// (`ISMBase::flush` writes the manager name as the payload of a root
+/// `"ISM"` object and `ISMBase::open64` reads it back, so casacore's
+/// `ColumnSet::dataManagerInfo` reports it as the `NAME` of the
+/// `getdminfo()` entry). `None` for bytes that are not an `"ISM"` blob —
+/// an unknown manager's raw spec, which stays named by its type.
+pub fn parse_ism_name(blob: &[u8]) -> Option<String> {
+    let mut r = crate::aipsio::Reader::new(blob);
+    let obj = r.read_object_start(true).ok()?;
+    if obj.type_name != "ISM" {
+        return None;
+    }
+    r.read_string().ok()
+}
+
 fn put_u32_e(buf: &mut [u8], off: usize, v: u32, big_endian: bool) {
     let b = if big_endian {
         v.to_be_bytes()
@@ -909,5 +924,18 @@ mod tests {
         assert_eq!(obj.type_name, "ISM");
         assert_eq!(obj.version, 3);
         assert_eq!(r.read_string().unwrap(), "IncrementalStMan");
+    }
+
+    #[test]
+    fn parses_the_manager_name_out_of_an_ism_blob() {
+        // The name the writer put in is the name casacore reports back.
+        assert_eq!(
+            parse_ism_name(&write_ism_blob("IndexingGroup")).as_deref(),
+            Some("IndexingGroup")
+        );
+        // Bytes that are not an ISM blob yield no name (they keep the
+        // type-name fallback).
+        assert_eq!(parse_ism_name(b"\xde\xad\xbe\xef"), None);
+        assert_eq!(parse_ism_name(&[]), None);
     }
 }

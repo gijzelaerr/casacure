@@ -49,6 +49,28 @@ fn array_col(
     }
 }
 
+/// A scalar column bound to a data manager type/group.
+fn scalar_col(name: &str, dt: DataType, group: &str, dm_type: &str) -> ColumnDesc {
+    let zero = match dt {
+        DataType::Double => RecordValue::Double(0.0),
+        _ => RecordValue::Int(0),
+    };
+    ColumnDesc {
+        name: name.into(),
+        comment: String::new(),
+        data_type: dt,
+        data_manager_type: dm_type.into(),
+        data_manager_group: group.into(),
+        options: 0,
+        ndim: -1,
+        shape: None,
+        max_length: 0,
+        keywords: empty_record(),
+        kind: ColumnKind::Scalar(zero),
+        tile_shape: None,
+    }
+}
+
 fn desc_of(columns: Vec<ColumnDesc>) -> TableDesc {
     TableDesc {
         name: String::new(),
@@ -366,6 +388,68 @@ fn created_columns_land_in_the_requested_managers() {
         panic!("expected a TSM spec, got {:?}", flag.spec)
     };
     assert_eq!(tile_shapes[0], vec![4, 6, 7]);
+}
+
+#[test]
+fn requested_names_survive_for_every_manager_including_indexing_ism() {
+    // dask-ms's MS builder: index columns go to an IncrementalStMan group
+    // with a custom name (`IndexingGroup`), arrays to per-column tiled
+    // groups, the rest to StandardStMan — `test_ms_builder` then asserts
+    // that every requested NAME comes back from `getdminfo()`.
+    let dir = testdir::TestDir::new("dminfo-create-names".to_string());
+    let mut desc = desc_of(vec![
+        scalar_col("TIME", DataType::Double, "StandardStMan", "StandardStMan"),
+        scalar_col(
+            "ANTENNA1",
+            DataType::Int,
+            "IndexingGroup",
+            "IncrementalStMan",
+        ),
+        array_col(
+            "DATA",
+            DataType::Complex,
+            vec![4, 6],
+            "DATA_GROUP",
+            "TiledColumnStMan",
+        ),
+    ]);
+    apply(
+        r#"{"*1": {"TYPE": "StandardStMan", "NAME": "StandardStMan",
+                   "COLUMNS": ["TIME"]},
+            "*2": {"TYPE": "IncrementalStMan", "NAME": "IndexingGroup",
+                   "COLUMNS": ["ANTENNA1"]},
+            "*3": {"TYPE": "TiledColumnStMan", "NAME": "DATA_GROUP",
+                   "SPEC": {"DEFAULTTILESHAPE": [4, 6, 5]}, "COLUMNS": ["DATA"]}}"#,
+        &mut desc,
+    )
+    .unwrap();
+
+    let nrow = 5;
+    let values = vec![
+        (0..nrow).map(|r| RecordValue::Double(r as f64)).collect(),
+        (0..nrow).map(|r| RecordValue::Int(r as i32)).collect(),
+        complexes(nrow, &[4, 6]),
+    ];
+    create_table(&dir, &desc, &values).unwrap();
+
+    let t = Table::open(&dir, true).unwrap();
+    assert_eq!(
+        values_of(&t, "ANTENNA1"),
+        values[1],
+        "the IncrementalStMan column round trips"
+    );
+
+    // Every requested NAME must be reported, whatever its manager type.
+    let info = get_dminfo(&dir, &t.dat).unwrap();
+    let names: Vec<&str> = info.values().map(|dm| dm.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["StandardStMan", "IndexingGroup", "DATA_GROUP"],
+        "requested NAMEs survive: {info:?}"
+    );
+    let ism = info.values().find(|dm| dm.name == "IndexingGroup").unwrap();
+    assert_eq!(ism.type_name, "IncrementalStMan");
+    assert_eq!(ism.columns, vec!["ANTENNA1".to_string()]);
 }
 
 #[test]
