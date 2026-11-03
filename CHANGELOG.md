@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.37] - 2026-11-03
+
 ### Fixed
 
 - **Every table now gets a `table.info` on creation, and the Python `table`
