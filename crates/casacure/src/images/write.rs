@@ -47,13 +47,17 @@ impl ImageMeta {
     }
 }
 
-/// The `table.info` marker of a PagedImage (casacore writes exactly this).
+/// The `table.info` marker of a PagedImage (casacore writes exactly this;
+/// the shared tableinfo module produces the bytes).
 fn write_table_info(path: &std::path::Path) -> Result<(), ImageError> {
-    std::fs::write(path.join("table.info"), "Type = Image\nSubType = \n\n").map_err(|e| {
-        ImageError::Other {
-            path: path.to_path_buf(),
-            msg: format!("cannot write table.info: {e}"),
-        }
+    crate::tableinfo::TableInfo {
+        r#type: "Image".into(),
+        ..Default::default()
+    }
+    .write(path)
+    .map_err(|e| ImageError::Other {
+        path: path.to_path_buf(),
+        msg: format!("cannot write table.info: {e}"),
     })
 }
 

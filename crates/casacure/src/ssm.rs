@@ -74,6 +74,8 @@ pub enum SsmError {
         offset: i32,
         length: u32,
     },
+    #[error("fixed-shape string cell implies {expected} strings, got {got}")]
+    FixedStringCountMismatch { expected: usize, got: usize },
 }
 
 /// The `StandardStMan` header at the start of the data file
@@ -850,8 +852,10 @@ pub fn read_array_cell(
         }));
     }
     // Multidim string arrays are stored in the string buckets: the cell is
-    // a 12-byte (bucket, offset, len) reference to the bucket content
-    // `[ndim][CASA dims][filled flag][len-prefixed strings]`.
+    // a 12-byte (bucket, offset, len) reference to the bucket content —
+    // `[ndim][CASA dims][filled flag][len-prefixed strings]` for a
+    // variable-shape column, `[len-prefixed strings]` only for a
+    // fixed-shape one (`SSMStringHandler::put/get(..., handleShape)`).
     if desc.data_type == DataType::String {
         let (cell, _) = file.cell_bytes(index_nr, *column_offset, row, 12)?;
         let (bucket, off, len) = if file.header.big_endian {
@@ -876,7 +880,20 @@ pub fn read_array_cell(
         }
         if len == 0 {
             // casacore marks an undefined string array cell ("no array")
-            // with a zero-length reference.
+            // with a zero-length reference. A variable-shape column reads
+            // it as the empty array (#8 convention); a fixed-shape column
+            // reads the column shape filled with the default "" —
+            // `SSMStringHandler::get` with length 0 sets the filled flag
+            // to 0 and yields `emptyString` per element into the shape the
+            // caller pre-sized from the column descriptor.
+            if let Some(shape) = desc.shape.as_deref().filter(|s| !s.is_empty()) {
+                let logical: Vec<u32> = shape.iter().rev().map(|&d| d as u32).collect();
+                let nelem: usize = logical.iter().map(|&d| d as usize).product();
+                return Ok(RecordValue::Array(ArrayValue {
+                    shape: logical,
+                    data: ArrayData::String(vec![String::new(); nelem]),
+                }));
+            }
             return Ok(RecordValue::Array(ArrayValue {
                 shape: Vec::new(),
                 data: ArrayData::String(Vec::new()),
@@ -892,7 +909,7 @@ pub fn read_array_cell(
         // CLI_COMMAND vector starting at offset 2724 of a full (used = 2800)
         // 2816-byte bucket whose `nextBucket` holds the rest.
         let content = file.read_string_bucket_bytes(bucket, off, len as u32)?;
-        let (logical, strings) = decode_string_array_content(&content)?;
+        let (logical, strings) = decode_string_array_content(&content, desc.shape.as_deref())?;
         return Ok(RecordValue::Array(ArrayValue {
             shape: logical,
             data: ArrayData::String(strings),
@@ -1866,10 +1883,24 @@ pub fn encode_array_record(
 }
 
 /// The canonical (big-endian) bytes of a multidim string array cell stored
-/// in the string buckets: `[ndim][CASA-order dims][filled flag 1]
-/// [len][bytes]...` per element in the cell's (as-given) order.
-/// This is `SSMStringHandler::put(Array<String>&, handleShape=true)`.
-pub fn encode_string_array_content(value: &crate::record::ArrayValue) -> Result<Vec<u8>, SsmError> {
+/// in the string buckets, as `SSMStringHandler::put(Array<String>&,
+/// handleShape)`:
+///
+/// - variable-shape cell (`fixed_shape` `None`/empty — `handleShape=true`,
+///   the `SSMIndStringColumn` path without a column shape):
+///   `[ndim][CASA-order dims][filled flag 1][len][bytes]...` per element
+///   in the cell's (as-given) order;
+/// - fixed-shape cell (`fixed_shape` non-empty — `handleShape=false`:
+///   `SSMIndStringColumn` delegates fixed-shape cells to `SSMDirColumn`,
+///   which stores only the strings and reconstructs the shape from the
+///   column descriptor; issues #24/#28): just `[len][bytes]...`.
+///
+/// `fixed_shape` is the column's stored (CASA-order) shape; the strings
+/// are written in logical element order either way.
+pub fn encode_string_array_content(
+    value: &crate::record::ArrayValue,
+    fixed_shape: Option<&[i64]>,
+) -> Result<Vec<u8>, SsmError> {
     use crate::record::ArrayData;
     let strings = match &value.data {
         ArrayData::String(v) => v,
@@ -1883,11 +1914,25 @@ pub fn encode_string_array_content(value: &crate::record::ArrayValue) -> Result<
     fn push_i32(out: &mut Vec<u8>, v: i32) {
         out.extend_from_slice(&v.to_be_bytes());
     }
-    push_i32(&mut out, value.shape.len() as i32); // ndim
-    for d in value.shape.iter().rev() {
-        push_i32(&mut out, *d as i32); // CASA-order dims (reversed logical)
+    if let Some(shape) = fixed_shape.filter(|s| !s.is_empty()) {
+        // Headerless layout: the shape lives in the column descriptor.
+        let expected: usize = shape
+            .iter()
+            .map(|&d| usize::try_from(d.max(0)).unwrap_or(0))
+            .product();
+        if strings.len() != expected {
+            return Err(SsmError::FixedStringCountMismatch {
+                expected,
+                got: strings.len(),
+            });
+        }
+    } else {
+        push_i32(&mut out, value.shape.len() as i32); // ndim
+        for d in value.shape.iter().rev() {
+            push_i32(&mut out, *d as i32); // CASA-order dims (reversed logical)
+        }
+        push_i32(&mut out, 1); // filled flag
     }
-    push_i32(&mut out, 1); // filled flag
     for s in strings {
         push_i32(&mut out, s.len() as i32);
         out.extend_from_slice(s.as_bytes());
@@ -1898,7 +1943,39 @@ pub fn encode_string_array_content(value: &crate::record::ArrayValue) -> Result<
 /// Decode the string-bucket content of a multidim string array cell: the
 /// inverse of `encode_string_array_content`, returning the logical
 /// (as-given) shape and string data.
-pub fn decode_string_array_content(content: &[u8]) -> Result<(Vec<u32>, Vec<String>), SsmError> {
+///
+/// For a fixed-shape column (`fixed_shape` non-empty, the column's stored
+/// CASA-order shape) the content normally holds no shape header — casacore
+/// stores the strings only and takes the shape from the column descriptor
+/// (#24). casacure up to 3.8.36 did write the header for fixed-shape
+/// columns (#28), so those files still read: a header matching the column
+/// descriptor exactly (ndim, dims, filled flag 1, strings consuming the
+/// whole content) is accepted; anything else is parsed as the headerless
+/// casacore layout.
+pub fn decode_string_array_content(
+    content: &[u8],
+    fixed_shape: Option<&[i64]>,
+) -> Result<(Vec<u32>, Vec<String>), SsmError> {
+    if let Some(shape) = fixed_shape.filter(|s| !s.is_empty()) {
+        let logical: Vec<u32> = shape.iter().rev().map(|&d| d as u32).collect();
+        let nelem: usize = logical
+            .iter()
+            .map(|&d| d as usize)
+            .reduce(|a, b| a.saturating_mul(b))
+            .unwrap_or(0);
+        if let Some(strings) = try_fixed_header_layout(content, &logical, nelem) {
+            return Ok((logical, strings));
+        }
+        let strings = decode_fixed_string_content(content, nelem)?;
+        return Ok((logical, strings));
+    }
+    decode_header_string_content(content)
+}
+
+/// The variable-shape cell layout: `[ndim][CASA-order dims][filled flag]
+/// [len][bytes]...` (`SSMStringHandler::put/get(..., handleShape=true)`),
+/// shape taken from the stored header.
+fn decode_header_string_content(content: &[u8]) -> Result<(Vec<u32>, Vec<String>), SsmError> {
     let mut p = 0usize;
     let read_i32 = |p: &mut usize| -> Result<i32, SsmError> {
         if *p + 4 > content.len() {
@@ -1957,6 +2034,101 @@ pub fn decode_string_array_content(content: &[u8]) -> Result<(Vec<u32>, Vec<Stri
     }
     Ok((logical, strings))
 }
+
+/// Try the header layout that casacure up to 3.8.36 wrote for fixed-shape
+/// string columns (casacore does not write one; #24/#28). Accepted only
+/// when the stored header matches the column descriptor exactly — same
+/// ndim and dims (in CASA order), filled flag 1, and the strings consume
+/// the whole content — so a genuine casacore cell whose first string
+/// length happens to read as a plausible `ndim` is never misparsed as
+/// this layout. `logical` is the column's logical shape; returns the
+/// nelem strings, or `None` if the content is not this layout.
+fn try_fixed_header_layout(content: &[u8], logical: &[u32], nelem: usize) -> Option<Vec<String>> {
+    let read_i32 = |p: usize| -> Option<i32> {
+        if p + 4 > content.len() {
+            return None;
+        }
+        Some(i32::from_be_bytes(content[p..p + 4].try_into().unwrap()))
+    };
+    let ndim = read_i32(0)?;
+    if ndim as usize != logical.len() {
+        return None;
+    }
+    let mut p = 4usize;
+    // The header stores the dims in CASA order (reversed logical).
+    for &d in logical.iter().rev() {
+        if read_i32(p)? != d as i32 {
+            return None;
+        }
+        p += 4;
+    }
+    if read_i32(p)? != 1 {
+        // filled flag
+        return None;
+    }
+    p += 4;
+    let mut strings = Vec::with_capacity(nelem);
+    for _ in 0..nelem {
+        let len = read_i32(p)?;
+        if len < 0 {
+            return None;
+        }
+        p += 4;
+        let len = len as usize;
+        if p + len > content.len() {
+            return None;
+        }
+        strings.push(String::from_utf8_lossy(&content[p..p + len]).into_owned());
+        p += len;
+    }
+    if p != content.len() {
+        return None;
+    }
+    Some(strings)
+}
+
+/// The fixed-shape cell layout: `nelem` length-prefixed strings with no
+/// shape header (`SSMStringHandler::put/get(..., handleShape=false)` via
+/// `SSMDirColumn`; the shape comes from the column descriptor).
+fn decode_fixed_string_content(content: &[u8], nelem: usize) -> Result<Vec<String>, SsmError> {
+    let mut p = 0usize;
+    let mut strings = Vec::with_capacity(nelem);
+    for _ in 0..nelem {
+        if p + 4 > content.len() {
+            return Err(SsmError::BadStringRef {
+                bucket: 0,
+                offset: p as i32,
+                length: 0,
+            });
+        }
+        let len = i32::from_be_bytes(content[p..p + 4].try_into().unwrap());
+        if len < 0 {
+            return Err(SsmError::BadStringRef {
+                bucket: 0,
+                offset: p as i32,
+                length: len as u32,
+            });
+        }
+        p += 4;
+        if p + len as usize > content.len() {
+            return Err(SsmError::BadStringRef {
+                bucket: 0,
+                offset: p as i32,
+                length: len as u32,
+            });
+        }
+        strings.push(String::from_utf8_lossy(&content[p..p + len as usize]).into_owned());
+        p += len as usize;
+    }
+    if p != content.len() {
+        return Err(SsmError::BadStringRef {
+            bucket: 0,
+            offset: p as i32,
+            length: (content.len() - p) as u32,
+        });
+    }
+    Ok(strings)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1968,8 +2140,8 @@ mod tests {
             shape: Vec::new(),
             data: crate::record::ArrayData::String(Vec::new()),
         };
-        let bytes = encode_string_array_content(&empty).unwrap();
-        let (shape, strings) = decode_string_array_content(&bytes).unwrap();
+        let bytes = encode_string_array_content(&empty, None).unwrap();
+        let (shape, strings) = decode_string_array_content(&bytes, None).unwrap();
         assert!(shape.is_empty());
         assert!(strings.is_empty());
 
@@ -1977,13 +2149,78 @@ mod tests {
             shape: vec![2],
             data: crate::record::ArrayData::String(vec!["RR".into(), "a longer string".into()]),
         };
-        let bytes = encode_string_array_content(&one).unwrap();
-        let (shape, strings) = decode_string_array_content(&bytes).unwrap();
+        let bytes = encode_string_array_content(&one, None).unwrap();
+        let (shape, strings) = decode_string_array_content(&bytes, None).unwrap();
         assert_eq!(shape, vec![2]);
         assert_eq!(
             strings,
             vec!["RR".to_string(), "a longer string".to_string()]
         );
+    }
+
+    /// A fixed-shape column stores the strings only — no `[ndim][dims]
+    /// [flag]` header — and the shape comes from the column descriptor
+    /// (`SSMStringHandler::put/get(..., handleShape=false)` via
+    /// `SSMDirColumn`; issues #24/#28).
+    #[test]
+    fn fixed_shape_string_content_is_headerless() {
+        let value = crate::record::ArrayValue {
+            // Column shape [2, 3] logical; desc.shape is stored CASA-order.
+            shape: vec![2, 3],
+            data: crate::record::ArrayData::String(vec![
+                "a".into(),
+                "bb".into(),
+                "".into(),
+                "dddd".into(),
+                "e5e5e".into(),
+                "666666".into(),
+            ]),
+        };
+        // CASA-order shape = reversed logical.
+        let bytes = encode_string_array_content(&value, Some(&[3, 2])).unwrap();
+        // First 4 bytes are the first string's length (1 for "a"), not ndim.
+        assert_eq!(&bytes[0..4], &1u32.to_be_bytes());
+        assert_eq!(
+            decode_string_array_content(&bytes, Some(&[3, 2])).unwrap(),
+            (vec![2, 3], value_string_vec(&value))
+        );
+        // The element count must match the column shape exactly.
+        let err = encode_string_array_content(&value, Some(&[7])).unwrap_err();
+        assert!(
+            err.to_string().contains("implies 7 strings, got 6"),
+            "{err}"
+        );
+    }
+
+    /// A fixed-shape string column written by casacure 3.8.36 (header
+    /// included) still reads, while a header that does not match the
+    /// column descriptor is not mistaken for this layout (#24).
+    #[test]
+    fn fixed_shape_string_content_reads_old_header_layout() {
+        let value = crate::record::ArrayValue {
+            shape: vec![2],
+            data: crate::record::ArrayData::String(vec!["p0".into(), "qq".into()]),
+        };
+        let header_bytes = encode_string_array_content(&value, None).unwrap();
+        // Same strings as the casacore-written layout.
+        assert_eq!(
+            decode_string_array_content(&header_bytes, Some(&[2])).unwrap(),
+            (vec![2], value_string_vec(&value))
+        );
+        // A header whose dims do not match the column falls through to the
+        // headerless layout (here: a first "length" of 2 = "p0", then "qq",
+        // then trailing bytes the headerless parser rejects).
+        let casacore_bytes = encode_string_array_content(&value, Some(&[2])).unwrap();
+        let mut padded = casacore_bytes.clone();
+        padded.extend_from_slice(&[0u8; 4]);
+        assert!(decode_string_array_content(&padded, Some(&[2])).is_err());
+    }
+
+    fn value_string_vec(value: &crate::record::ArrayValue) -> Vec<String> {
+        match &value.data {
+            crate::record::ArrayData::String(v) => v.clone(),
+            _ => unreachable!(),
+        }
     }
 
     /// Minimal BigEndian file-builder helpers for unit tests.

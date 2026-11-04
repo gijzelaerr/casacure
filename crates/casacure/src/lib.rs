@@ -21,6 +21,7 @@ pub mod record;
 pub mod ssm;
 pub mod table;
 pub mod tabledesc;
+pub mod tableinfo;
 pub mod taql;
 #[cfg(test)]
 mod testdir;

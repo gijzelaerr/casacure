@@ -46,6 +46,8 @@ pub enum MsError {
     #[error("storage error: {0}")]
     Storage(String),
     #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
     Record(#[from] crate::record::RecordError),
     #[error(transparent)]
     DmInfo(#[from] crate::tabledesc::DmInfoError),
@@ -135,6 +137,9 @@ pub fn default_ms(
         );
     }
     wt.flush()?;
+    // casacore's MS creation marks the main table's `table.info` with the
+    // type and readme (issue #23); the subtables stay plain.
+    crate::tableinfo::TableInfo::ms_main().write(&path)?;
 
     for sub in STANDARD_SUBTABLES {
         let sub_desc = required_ms_desc(Some(sub))?;

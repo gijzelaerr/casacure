@@ -66,10 +66,38 @@ struct WriteData {
     dirty: bool,
     /// The table directory this backing belongs to (see [`DirPin`]).
     pin: DirPin,
+    /// The column names on disk as of the last sync (backing creation,
+    /// flush, or out-of-band refresh) — NOT the live `wt` desc, which
+    /// `addcols` extends before the flush. Compared with a fresh parse of
+    /// `table.dat` when a later open reuses the backing, so a column
+    /// another writer added (python-casacore, dask-ms; issue #30) makes
+    /// the backing re-materialise instead of serving the stale schema —
+    /// and a *dirty* backing is refused rather than flushed over the
+    /// foreign column, which would rewrite `table.dat` without it.
+    disk_columns: Vec<String>,
     /// Set for a TaQL query result materialised under the temp dir: the
     /// directory is removed when the last handle on this backing drops.
     /// Declared LAST so `read`/`wt` are closed before it is removed.
     scratch: Option<ScratchDir>,
+}
+
+/// The column names in `table.dat` right now (`None` if unreadable — the
+/// directory no longer holds a table).
+fn disk_column_names(dir: &std::path::Path) -> Option<Vec<String>> {
+    let bytes = std::fs::read(dir.join("table.dat")).ok()?;
+    let dat = core::parse_table_dat(&bytes).ok()?;
+    Some(dat.desc.columns.iter().map(|c| c.name.clone()).collect())
+}
+
+/// Whether `table.dat`'s column set differs from `names` (the backing's
+/// last-synced view): another writer added, removed or renamed a column
+/// out of band (issue #30). Unreadable `table.dat` counts as changed (the
+/// callers re-materialise from disk or drop the entry anyway).
+fn disk_columns_differ(dir: &std::path::Path, names: &[String]) -> bool {
+    match disk_column_names(dir) {
+        Some(now) => now != names,
+        None => true,
+    }
 }
 
 /// A TaQL result table's temp directory, removed when dropped (casacore keeps
@@ -509,6 +537,14 @@ fn refresh_write(
     s.wt = wt;
     s.dirty = false;
     s.pin = DirPin::new(dir);
+    s.disk_columns = s
+        .read
+        .dat
+        .desc
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
     true
 }
 
@@ -518,11 +554,27 @@ fn refresh_write(
 /// table rewrite happens here (explicit `flush()`, on `close()`/context exit,
 /// or before a mutating taql statement reads the snapshot). A no-op when the
 /// store is clean, so repeated writes do not rewrite the whole table per call.
-fn flush_if_dirty(shared: &std::sync::Arc<std::sync::Mutex<WriteData>>) -> PyResult<()> {
+fn flush_if_dirty(
+    dir: &std::path::Path,
+    shared: &std::sync::Arc<std::sync::Mutex<WriteData>>,
+) -> PyResult<()> {
     let mut s = shared.lock().unwrap();
     if s.dirty {
-        let dir = s.wt.flush().map_err(err)?;
-        s.read = ::casacure::Table::open(&dir, false).map_err(err)?;
+        // Another writer changed the columns on disk since the last sync:
+        // flushing would rewrite `table.dat` from this backing's (now
+        // stale) desc and silently drop the foreign column (issue #30's
+        // write-over variant). Refuse instead — the caller surfaces it.
+        if disk_columns_differ(dir, &s.disk_columns) {
+            return Err(PyRuntimeError::new_err(format!(
+                "{}: the table's columns changed on disk (another writer's \
+                 addcols/removecols) while this handle holds unflushed \
+                 writes; the write would drop the foreign column",
+                dir.display()
+            )));
+        }
+        let flushed = s.wt.flush().map_err(err)?;
+        s.read = ::casacure::Table::open(&flushed, false).map_err(err)?;
+        s.disk_columns = s.wt.desc().columns.iter().map(|c| c.name.clone()).collect();
         s.dirty = false;
     }
     Ok(())
@@ -1086,11 +1138,19 @@ user,usernoread,permanent,permanentwait"
             }
             let _ = wt.flush().map_err(err)?;
             let read = ::casacure::Table::open_with_lock(&dir, false, options).map_err(err)?;
+            let disk_columns = read
+                .dat
+                .desc
+                .columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
             let shared = std::sync::Arc::new(std::sync::Mutex::new(WriteData {
                 read,
                 wt,
                 dirty: false,
                 pin: DirPin::new(&dir),
+                disk_columns,
                 scratch: None,
             }));
             register_write(&dir, &shared);
@@ -1119,7 +1179,7 @@ user,usernoread,permanent,permanentwait"
             // the files: the last state the writer actually persisted.
             if let Some(shared) = find_write(&dir) {
                 if shared.lock().unwrap().dirty {
-                    let _ = flush_if_dirty(&shared);
+                    let _ = flush_if_dirty(&dir, &shared);
                 }
             }
             let read = ::casacure::Table::open_with_lock(&dir, true, options).map_err(err)?;
@@ -1140,16 +1200,35 @@ user,usernoread,permanent,permanentwait"
         // with another *process* holding the lock — fcntl locks do not
         // conflict within one process).
         if let Some(shared) = find_write(&dir) {
-            // The backing is stale if another process grew the table since
-            // this one's last flush (nothing pending here): adopt the
+            // The backing is stale if another process grew the table or
+            // changed its columns (addcols/removecols/rename; issue #30 —
+            // python-casacore and dask-ms 0.2.x create columns out of band)
+            // since this one's last sync (nothing pending here): adopt the
             // on-disk state, keeping the caller's locking options.
-            let stale = {
+            let (stale, schema_conflict) = {
                 let s = shared.lock().unwrap();
-                !s.dirty
-                    && ::casacure::lock_sync_nrrow(&dir)
-                        .filter(|&n| n != 0)
-                        .is_some_and(|n| n > s.wt.nrows())
+                let schema_changed = disk_columns_differ(&dir, &s.disk_columns);
+                let rows_grew = ::casacure::lock_sync_nrrow(&dir)
+                    .filter(|&n| n != 0)
+                    .is_some_and(|n| n > s.wt.nrows());
+                (
+                    !s.dirty && (rows_grew || schema_changed),
+                    s.dirty && schema_changed,
+                )
             };
+            // A schema change with pending writes must NOT be flushed over:
+            // the flush rewrites `table.dat` from this backing's stale desc
+            // and silently drops the foreign column. Refuse instead (the
+            // same message `flush()` itself raises via `flush_if_dirty`).
+            if schema_conflict {
+                return Err(PyRuntimeError::new_err(format!(
+                    "{}: the table's columns changed on disk (another \
+                     writer's addcols/removecols) while this handle holds \
+                     unflushed writes; the write would drop the foreign \
+                     column",
+                    dir.display()
+                )));
+            }
             if stale && !refresh_write(&dir, &shared, options) {
                 return Err(err(format!(
                     "{}: table changed on disk and could not be reloaded",
@@ -1186,6 +1265,13 @@ user,usernoread,permanent,permanentwait"
         let (read, wt) =
             core::WritableTable::open_for_update_with_lock(&dir, options).map_err(err)?;
         let shared = std::sync::Arc::new(std::sync::Mutex::new(WriteData {
+            disk_columns: read
+                .dat
+                .desc
+                .columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
             read,
             wt,
             dirty: false,
@@ -1278,7 +1364,7 @@ user,usernoread,permanent,permanentwait"
                 // The on-disk state must include this handle's pending
                 // (unflushed) writes; `query()`/`sort()`/`select_run()`
                 // run against the files.
-                flush_if_dirty(shared)?;
+                flush_if_dirty(&self.dir_of(), shared)?;
                 std::sync::Arc::new(::casacure::Table::open(self.dir_of(), false).map_err(err)?)
             }
         })
@@ -1567,6 +1653,94 @@ impl Table {
         Ok(d.into_any().unbind())
     }
 
+    /// `info()` -> dict `{'type', 'subType', 'readme'}` — the table's
+    /// `table.info` file (casacore `Table::info()`). A table without the
+    /// file (written before casacure created it, or deleted afterwards)
+    /// reads as empty strings, like casacore.
+    fn info(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let dir = self.dir_of();
+        let info = core::tableinfo::TableInfo::read(&dir).map_err(err)?;
+        let d = PyDict::new(py);
+        d.set_item("type", info.r#type)?;
+        d.set_item("subType", info.sub_type)?;
+        d.set_item("readme", info.readme)?;
+        Ok(d.into_any().unbind())
+    }
+
+    /// `putinfo(dict)` — set any of `type`, `subType`, `readme` on the
+    /// table's `table.info` (casacore `TableProxy::putinfo`, probed against
+    /// python-casacore 3.8.1): fields absent from the dict keep their
+    /// value, the readme is stored as whole lines (a missing trailing
+    /// newline is appended), and an unknown field is the casacore
+    /// `RuntimeError` naming the accepted keys.
+    fn putinfo(&self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let dict = value.cast::<PyDict>().map_err(|_| {
+            PyTypeError::new_err("putinfo takes a dict with the fields type, subType, readme")
+        })?;
+        // Validate the whole dict before touching anything (casacore
+        // converts the record first, so a bad shape fails even on a
+        // read-only table).
+        let mut new_type: Option<String> = None;
+        let mut new_sub_type: Option<String> = None;
+        let mut new_readme: Option<String> = None;
+        for (k, v) in dict.iter() {
+            let key = k.extract::<String>()?;
+            let target = match key.as_str() {
+                "type" => &mut new_type,
+                "subType" => &mut new_sub_type,
+                "readme" => &mut new_readme,
+                other => {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "Name of field {other} must be type, subType or readme"
+                    )))
+                }
+            };
+            *target = Some(v.extract().map_err(|_| {
+                PyRuntimeError::new_err(format!(
+                    "RecordRep::get_pointer - field {key} must be a string"
+                ))
+            })?);
+        }
+        let dir = self.dir_of();
+        let inner = self.inner.lock().unwrap();
+        match &*inner {
+            Inner::Write { .. } => {
+                // table.info is metadata beside the data files (like the
+                // keywords' table.dat home, but a plain text file): write
+                // it through, no cell flush involved.
+                let mut info = core::tableinfo::TableInfo::read(&dir).map_err(err)?;
+                if let Some(t) = new_type {
+                    info.r#type = t;
+                }
+                if let Some(s) = new_sub_type {
+                    info.sub_type = s;
+                }
+                if let Some(r) = new_readme {
+                    info.readme = r;
+                }
+                info.write(&dir).map_err(err)?;
+                Ok(())
+            }
+            _ => Err(not_writable(self.view)),
+        }
+    }
+
+    /// `addreadmeline(line)` — append a line to the table info's readme.
+    fn addreadmeline(&self, line: &str) -> PyResult<()> {
+        let dir = self.dir_of();
+        let inner = self.inner.lock().unwrap();
+        match &*inner {
+            Inner::Write { .. } => {
+                let mut info = core::tableinfo::TableInfo::read(&dir).map_err(err)?;
+                info.readme.push_str(line);
+                info.readme.push('\n');
+                info.write(&dir).map_err(err)?;
+                Ok(())
+            }
+            _ => Err(not_writable(self.view)),
+        }
+    }
+
     /// `getdminfo()` -> dict.
     fn getdminfo(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.lock().unwrap();
@@ -1579,7 +1753,7 @@ impl Table {
                 // Descriptors may carry unflushed structural changes
                 // (addcols/removecols/keywords), so persist before reading
                 // the on-disk metadata snapshot.
-                flush_if_dirty(shared)?;
+                flush_if_dirty(&self.dir_of(), shared)?;
                 let s = shared.lock().unwrap();
                 let dir = PathBuf::from(s.read.name());
                 core::get_dminfo(&dir, &s.read.dat).map_err(err)?
@@ -2048,7 +2222,7 @@ impl Table {
     fn flush(&self) -> PyResult<()> {
         let mut inner = self.inner.lock().unwrap();
         if let Inner::Write { shared } = &mut *inner {
-            flush_if_dirty(shared)?;
+            flush_if_dirty(&self.dir_of(), shared)?;
         }
         Ok(())
     }
@@ -2519,11 +2693,15 @@ impl Table {
         let d = PyDict::new(py);
         for r in 0..nrow {
             let v = self.read_cell(col_idx, startrow + r)?;
-            if let RecordValue::Array(_) = v {
-                d.set_item(format!("r{}", r + 1), convert::cell_to_py(py, &v)?)?;
-            } else {
-                d.set_item(format!("r{}", r + 1), convert::cell_to_py(py, &v)?)?;
-            }
+            // python-casacore numbers the keys from row 0 of the table
+            // (`getvarcol("V", 1, 2)` -> r2, r3), not from the window's
+            // start. (The dict-form putcol/putvarcol input is a different
+            // convention: dask-ms builds {"r%d" % i} keys 0-based —
+            // conftest.py — so its "rN" means row N.)
+            d.set_item(
+                format!("r{}", startrow + r + 1),
+                convert::cell_to_py(py, &v)?,
+            )?;
         }
         Ok(d.into_any().unbind())
     }
@@ -2548,7 +2726,53 @@ impl Table {
         value: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let col_idx = self.col_index(column)?;
-        let rec = keyword_value(py, value)?;
+        let is_array_col = matches!(
+            self.desc().columns[col_idx].kind,
+            core::tabledesc::ColumnKind::Array
+        );
+        let rec = if is_array_col {
+            // One cell of an array column: route through the shared putcol
+            // cell conversion (dtype coercion to the column's element type,
+            // numpy string arrays, string-array dicts) by promoting the cell
+            // to a single-row batch. putcell used to go through
+            // `keyword_value`, which cannot convert numeric or string
+            // ndarrays, so every array value except already-matching Python
+            // scalars-in-lists was rejected where python-casacore accepts
+            // them (issue #29: float, int64, short, complex, dcomplex —
+            // and numpy string arrays / nested lists).
+            let is_seq = value.cast::<PyList>().is_ok() || value.cast::<PyTuple>().is_ok();
+            let is_ndarray = !is_seq && value.getattr("dtype").is_ok();
+            if is_seq || is_ndarray {
+                let np = py.import("numpy")?;
+                let arr = if is_seq {
+                    np.getattr("asanyarray")?.call1((value,))?
+                } else {
+                    value.clone()
+                };
+                let shape: Vec<i64> = arr.getattr("shape")?.extract()?;
+                let mut promoted = vec![1i64];
+                promoted.extend(shape.iter().copied());
+                let promoted = arr.call_method1("reshape", (promoted,))?;
+                let mut cells = self.value_to_cells(py, col_idx, &promoted, 1, true, false)?;
+                cells.pop().unwrap_or(RecordValue::Int(0))
+            } else {
+                keyword_value(py, value)?
+            }
+        } else if matches!(
+            self.desc().columns[col_idx].kind,
+            core::tabledesc::ColumnKind::Scalar(_)
+        ) {
+            // A lone scalar, cast to the column's type like every putcol
+            // element is (a Python 42.0 into a float column stores as
+            // float32, not rejected).
+            let rec = keyword_value(py, value)?;
+            match self.desc().columns[col_idx].data_type {
+                core::record::DataType::Table | core::record::DataType::Record => rec,
+                dt => convert::cast_scalar_to(&dt, &rec),
+            }
+        } else {
+            keyword_value(py, value)?
+        };
         self.put_cell(col_idx, row, rec)?;
         Ok(())
     }
@@ -2636,12 +2860,21 @@ impl Table {
             for (i, (row_offset, v)) in rows.into_iter().enumerate() {
                 let row = startrow + row_offset;
                 let desc = self.desc();
-                let is_array_col = matches!(
-                    desc.columns[col_idx].kind,
-                    core::tabledesc::ColumnKind::Array
-                );
+                let cd = &desc.columns[col_idx];
+                let is_array_col = matches!(cd.kind, core::tabledesc::ColumnKind::Array);
                 let mut cells = self.value_to_cells(py, col_idx, &v, 1, is_array_col, true)?;
                 let rec = cells.pop().unwrap_or(RecordValue::Int(0));
+                // A lone scalar is cast to the column's type like every
+                // other putcol element (a plain 99.0 into a float column
+                // stores as float, not rejected).
+                let rec = if matches!(cd.kind, core::tabledesc::ColumnKind::Scalar(_)) {
+                    match cd.data_type {
+                        core::record::DataType::Table | core::record::DataType::Record => rec,
+                        dt => convert::cast_scalar_to(&dt, &rec),
+                    }
+                } else {
+                    rec
+                };
                 self.put_cell(col_idx, row, rec)?;
                 let _ = i;
             }
@@ -3830,7 +4063,7 @@ pub fn taql(
                 .map_err(|_| PyValueError::new_err("taql: expected table objects"))?;
             let inner = obj.inner.lock().unwrap();
             if let Inner::Write { shared, .. } = &*inner {
-                flush_if_dirty(shared)?;
+                flush_if_dirty(&obj.dir_of(), shared)?;
             }
         }
         objects = ts
@@ -4006,11 +4239,19 @@ fn taql_result_to_table(_py: Python<'_>, out: core::taql::TaqlTable) -> PyResult
     }
     let _ = wt.flush().map_err(err)?;
     let read = ::casacure::Table::open(&dir, false).map_err(err)?;
+    let disk_columns = read
+        .dat
+        .desc
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
     let shared = std::sync::Arc::new(std::sync::Mutex::new(WriteData {
         read,
         wt,
         dirty: false,
         pin: DirPin::new(&dir),
+        disk_columns,
         scratch: Some(scratch),
     }));
     register_write(&dir, &shared);

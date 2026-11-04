@@ -39,6 +39,15 @@ pub enum ColumnKind {
     Record,
 }
 
+/// `ColumnDesc::Options`: array data stored directly in the table file.
+/// Forces `COLUMN_OPTION_FIXED_SHAPE` (`BaseColumnDesc`, casacore).
+pub const COLUMN_OPTION_DIRECT: i32 = 1;
+/// `ColumnDesc::Options`: `Undefined` scalars may be unassigned.
+pub const COLUMN_OPTION_UNDEFINED: i32 = 2;
+/// `ColumnDesc::Options`: the cell shape is fixed (implied by a shape or
+/// by `COLUMN_OPTION_DIRECT`).
+pub const COLUMN_OPTION_FIXED_SHAPE: i32 = 4;
+
 /// A parsed column descriptor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDesc {
@@ -263,7 +272,21 @@ pub(crate) fn column_from_desc_dict(
         Some(RecordValue::Int64(i)) => *i as i32,
         _ => -1,
     };
-    let shape = shape_elems.map(|dims| dims.into_iter().rev().collect());
+    let shape: Option<Vec<i64>> = shape_elems.map(|dims| dims.into_iter().rev().collect());
+    // Normalize the option bits like `BaseColumnDesc`'s constructor:
+    // Direct forces FixedShape, and a shape can only be given for a
+    // FixedShape array. Without the FixedShape bit casacore reads the
+    // column back as variable-shape (`ColumnDesc::isFixedShape` checks
+    // the stored bits, no normalization on load), so `getcol` of a
+    // fixed-shape string column iterates by scalars and dies — the
+    // descriptor half of issues #24/#28.
+    let options = if shape.as_ref().is_some_and(|s| !s.is_empty())
+        || options & crate::tabledesc::COLUMN_OPTION_DIRECT != 0
+    {
+        options | crate::tabledesc::COLUMN_OPTION_FIXED_SHAPE
+    } else {
+        options
+    };
 
     let keywords = match get("keywords") {
         Some(RecordValue::Record(r)) => r.clone(),

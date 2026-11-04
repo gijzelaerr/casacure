@@ -33,6 +33,7 @@ Requires: invoke, plumbum, docker, gh (authenticated), cargo, rustup (for
 the --sanitizers job).
 """
 import json
+import os
 import re
 import subprocess
 import time
@@ -44,6 +45,29 @@ from plumbum import FG, local
 
 REPO = Path(__file__).parent
 IMAGE = "casacure-pre-release"
+
+# pytest's temp root for the host-side runs. One full suite run writes ~3 GB
+# of image round-trip tables through the tmp_path fixture, and pytest keeps
+# the last three runs -- on a tmpfs /tmp that is 9+ GB against a 7.8 GB
+# filesystem, so `invoke release`'s final push (whose pre-push gate reruns
+# the suite on the host, `.githooks/pre-push`) filled /tmp and died. A
+# disk-backed --basetemp is wiped at the start of every pytest run, so the
+# footprint is bounded to exactly one run and nothing accumulates.
+PYTEST_BASETEMP = "/var/tmp/pytest-gate"
+
+
+def _bound_pytest_temp() -> None:
+    """Point pytest at [`PYTEST_BASETEMP`] for this process tree.
+
+    PYTEST_ADDOPTS propagates through the pre-push hook's `git push` (plumbum
+    inherits the environment, the hook inherits it, pytest picks the variable
+    up); docker runs are unaffected (containers do not inherit the host env).
+    """
+    Path(PYTEST_BASETEMP).mkdir(parents=True, exist_ok=True)
+    opt = f"--basetemp={PYTEST_BASETEMP}"
+    addopts = os.environ.get("PYTEST_ADDOPTS", "")
+    if opt not in addopts:
+        os.environ["PYTEST_ADDOPTS"] = f"{addopts} {opt}".strip()
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +319,10 @@ def release(c,
 
     Idempotent: a tag already on origin is verified and skipped, not re-pushed.
     """
+    # The final `git push` runs the pre-push gate, whose host-side pytest
+    # would otherwise fill a tmpfs /tmp (see PYTEST_BASETEMP).
+    _bound_pytest_temp()
+
     # An explicit --version means "tag exactly this"; the tree's version must
     # not be touched or the tag and tree would drift apart.
     if version is not None:
