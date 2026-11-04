@@ -57,7 +57,6 @@ subtasks are moved here.
   MEASURES_ACCURACY.md documents the contract against.  Unchanged
   otherwise: 505 passed / 37 skipped / 3 xfailed, century grid worst
   0.026″ (the documented figure).
->>>>>>> origin/main
 
 ## [3.8.36] - 2026-11-02
 
