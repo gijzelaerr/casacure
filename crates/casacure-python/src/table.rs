@@ -2695,7 +2695,53 @@ impl Table {
         value: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let col_idx = self.col_index(column)?;
-        let rec = keyword_value(py, value)?;
+        let is_array_col = matches!(
+            self.desc().columns[col_idx].kind,
+            core::tabledesc::ColumnKind::Array
+        );
+        let rec = if is_array_col {
+            // One cell of an array column: route through the shared putcol
+            // cell conversion (dtype coercion to the column's element type,
+            // numpy string arrays, string-array dicts) by promoting the cell
+            // to a single-row batch. putcell used to go through
+            // `keyword_value`, which cannot convert numeric or string
+            // ndarrays, so every array value except already-matching Python
+            // scalars-in-lists was rejected where python-casacore accepts
+            // them (issue #29: float, int64, short, complex, dcomplex —
+            // and numpy string arrays / nested lists).
+            let is_seq = value.cast::<PyList>().is_ok() || value.cast::<PyTuple>().is_ok();
+            let is_ndarray = !is_seq && value.getattr("dtype").is_ok();
+            if is_seq || is_ndarray {
+                let np = py.import("numpy")?;
+                let arr = if is_seq {
+                    np.getattr("asanyarray")?.call1((value,))?
+                } else {
+                    value.clone()
+                };
+                let shape: Vec<i64> = arr.getattr("shape")?.extract()?;
+                let mut promoted = vec![1i64];
+                promoted.extend(shape.iter().copied());
+                let promoted = arr.call_method1("reshape", (promoted,))?;
+                let mut cells = self.value_to_cells(py, col_idx, &promoted, 1, true, false)?;
+                cells.pop().unwrap_or(RecordValue::Int(0))
+            } else {
+                keyword_value(py, value)?
+            }
+        } else if matches!(
+            self.desc().columns[col_idx].kind,
+            core::tabledesc::ColumnKind::Scalar(_)
+        ) {
+            // A lone scalar, cast to the column's type like every putcol
+            // element is (a Python 42.0 into a float column stores as
+            // float32, not rejected).
+            let rec = keyword_value(py, value)?;
+            match self.desc().columns[col_idx].data_type {
+                core::record::DataType::Table | core::record::DataType::Record => rec,
+                dt => convert::cast_scalar_to(&dt, &rec),
+            }
+        } else {
+            keyword_value(py, value)?
+        };
         self.put_cell(col_idx, row, rec)?;
         Ok(())
     }
