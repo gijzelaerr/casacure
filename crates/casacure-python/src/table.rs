@@ -66,10 +66,38 @@ struct WriteData {
     dirty: bool,
     /// The table directory this backing belongs to (see [`DirPin`]).
     pin: DirPin,
+    /// The column names on disk as of the last sync (backing creation,
+    /// flush, or out-of-band refresh) — NOT the live `wt` desc, which
+    /// `addcols` extends before the flush. Compared with a fresh parse of
+    /// `table.dat` when a later open reuses the backing, so a column
+    /// another writer added (python-casacore, dask-ms; issue #30) makes
+    /// the backing re-materialise instead of serving the stale schema —
+    /// and a *dirty* backing is refused rather than flushed over the
+    /// foreign column, which would rewrite `table.dat` without it.
+    disk_columns: Vec<String>,
     /// Set for a TaQL query result materialised under the temp dir: the
     /// directory is removed when the last handle on this backing drops.
     /// Declared LAST so `read`/`wt` are closed before it is removed.
     scratch: Option<ScratchDir>,
+}
+
+/// The column names in `table.dat` right now (`None` if unreadable — the
+/// directory no longer holds a table).
+fn disk_column_names(dir: &std::path::Path) -> Option<Vec<String>> {
+    let bytes = std::fs::read(dir.join("table.dat")).ok()?;
+    let dat = core::parse_table_dat(&bytes).ok()?;
+    Some(dat.desc.columns.iter().map(|c| c.name.clone()).collect())
+}
+
+/// Whether `table.dat`'s column set differs from `names` (the backing's
+/// last-synced view): another writer added, removed or renamed a column
+/// out of band (issue #30). Unreadable `table.dat` counts as changed (the
+/// callers re-materialise from disk or drop the entry anyway).
+fn disk_columns_differ(dir: &std::path::Path, names: &[String]) -> bool {
+    match disk_column_names(dir) {
+        Some(now) => now != names,
+        None => true,
+    }
 }
 
 /// A TaQL result table's temp directory, removed when dropped (casacore keeps
@@ -509,6 +537,14 @@ fn refresh_write(
     s.wt = wt;
     s.dirty = false;
     s.pin = DirPin::new(dir);
+    s.disk_columns = s
+        .read
+        .dat
+        .desc
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
     true
 }
 
@@ -518,11 +554,27 @@ fn refresh_write(
 /// table rewrite happens here (explicit `flush()`, on `close()`/context exit,
 /// or before a mutating taql statement reads the snapshot). A no-op when the
 /// store is clean, so repeated writes do not rewrite the whole table per call.
-fn flush_if_dirty(shared: &std::sync::Arc<std::sync::Mutex<WriteData>>) -> PyResult<()> {
+fn flush_if_dirty(
+    dir: &std::path::Path,
+    shared: &std::sync::Arc<std::sync::Mutex<WriteData>>,
+) -> PyResult<()> {
     let mut s = shared.lock().unwrap();
     if s.dirty {
-        let dir = s.wt.flush().map_err(err)?;
-        s.read = ::casacure::Table::open(&dir, false).map_err(err)?;
+        // Another writer changed the columns on disk since the last sync:
+        // flushing would rewrite `table.dat` from this backing's (now
+        // stale) desc and silently drop the foreign column (issue #30's
+        // write-over variant). Refuse instead — the caller surfaces it.
+        if disk_columns_differ(dir, &s.disk_columns) {
+            return Err(PyRuntimeError::new_err(format!(
+                "{}: the table's columns changed on disk (another writer's \
+                 addcols/removecols) while this handle holds unflushed \
+                 writes; the write would drop the foreign column",
+                dir.display()
+            )));
+        }
+        let flushed = s.wt.flush().map_err(err)?;
+        s.read = ::casacure::Table::open(&flushed, false).map_err(err)?;
+        s.disk_columns = s.wt.desc().columns.iter().map(|c| c.name.clone()).collect();
         s.dirty = false;
     }
     Ok(())
@@ -1059,11 +1111,19 @@ user,usernoread,permanent,permanentwait"
             }
             let _ = wt.flush().map_err(err)?;
             let read = ::casacure::Table::open_with_lock(&dir, false, options).map_err(err)?;
+            let disk_columns = read
+                .dat
+                .desc
+                .columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
             let shared = std::sync::Arc::new(std::sync::Mutex::new(WriteData {
                 read,
                 wt,
                 dirty: false,
                 pin: DirPin::new(&dir),
+                disk_columns,
                 scratch: None,
             }));
             register_write(&dir, &shared);
@@ -1092,7 +1152,7 @@ user,usernoread,permanent,permanentwait"
             // the files: the last state the writer actually persisted.
             if let Some(shared) = find_write(&dir) {
                 if shared.lock().unwrap().dirty {
-                    let _ = flush_if_dirty(&shared);
+                    let _ = flush_if_dirty(&dir, &shared);
                 }
             }
             let read = ::casacure::Table::open_with_lock(&dir, true, options).map_err(err)?;
@@ -1113,16 +1173,35 @@ user,usernoread,permanent,permanentwait"
         // with another *process* holding the lock — fcntl locks do not
         // conflict within one process).
         if let Some(shared) = find_write(&dir) {
-            // The backing is stale if another process grew the table since
-            // this one's last flush (nothing pending here): adopt the
+            // The backing is stale if another process grew the table or
+            // changed its columns (addcols/removecols/rename; issue #30 —
+            // python-casacore and dask-ms 0.2.x create columns out of band)
+            // since this one's last sync (nothing pending here): adopt the
             // on-disk state, keeping the caller's locking options.
-            let stale = {
+            let (stale, schema_conflict) = {
                 let s = shared.lock().unwrap();
-                !s.dirty
-                    && ::casacure::lock_sync_nrrow(&dir)
-                        .filter(|&n| n != 0)
-                        .is_some_and(|n| n > s.wt.nrows())
+                let schema_changed = disk_columns_differ(&dir, &s.disk_columns);
+                let rows_grew = ::casacure::lock_sync_nrrow(&dir)
+                    .filter(|&n| n != 0)
+                    .is_some_and(|n| n > s.wt.nrows());
+                (
+                    !s.dirty && (rows_grew || schema_changed),
+                    s.dirty && schema_changed,
+                )
             };
+            // A schema change with pending writes must NOT be flushed over:
+            // the flush rewrites `table.dat` from this backing's stale desc
+            // and silently drops the foreign column. Refuse instead (the
+            // same message `flush()` itself raises via `flush_if_dirty`).
+            if schema_conflict {
+                return Err(PyRuntimeError::new_err(format!(
+                    "{}: the table's columns changed on disk (another \
+                     writer's addcols/removecols) while this handle holds \
+                     unflushed writes; the write would drop the foreign \
+                     column",
+                    dir.display()
+                )));
+            }
             if stale && !refresh_write(&dir, &shared, options) {
                 return Err(err(format!(
                     "{}: table changed on disk and could not be reloaded",
@@ -1159,6 +1238,13 @@ user,usernoread,permanent,permanentwait"
         let (read, wt) =
             core::WritableTable::open_for_update_with_lock(&dir, options).map_err(err)?;
         let shared = std::sync::Arc::new(std::sync::Mutex::new(WriteData {
+            disk_columns: read
+                .dat
+                .desc
+                .columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
             read,
             wt,
             dirty: false,
@@ -1251,7 +1337,7 @@ user,usernoread,permanent,permanentwait"
                 // The on-disk state must include this handle's pending
                 // (unflushed) writes; `query()`/`sort()`/`select_run()`
                 // run against the files.
-                flush_if_dirty(shared)?;
+                flush_if_dirty(&self.dir_of(), shared)?;
                 std::sync::Arc::new(::casacure::Table::open(self.dir_of(), false).map_err(err)?)
             }
         })
@@ -1640,7 +1726,7 @@ impl Table {
                 // Descriptors may carry unflushed structural changes
                 // (addcols/removecols/keywords), so persist before reading
                 // the on-disk metadata snapshot.
-                flush_if_dirty(shared)?;
+                flush_if_dirty(&self.dir_of(), shared)?;
                 let s = shared.lock().unwrap();
                 let dir = PathBuf::from(s.read.name());
                 core::get_dminfo(&dir, &s.read.dat).map_err(err)?
@@ -2109,7 +2195,7 @@ impl Table {
     fn flush(&self) -> PyResult<()> {
         let mut inner = self.inner.lock().unwrap();
         if let Inner::Write { shared } = &mut *inner {
-            flush_if_dirty(shared)?;
+            flush_if_dirty(&self.dir_of(), shared)?;
         }
         Ok(())
     }
@@ -3890,7 +3976,7 @@ pub fn taql(
                 .map_err(|_| PyValueError::new_err("taql: expected table objects"))?;
             let inner = obj.inner.lock().unwrap();
             if let Inner::Write { shared, .. } = &*inner {
-                flush_if_dirty(shared)?;
+                flush_if_dirty(&obj.dir_of(), shared)?;
             }
         }
         objects = ts
@@ -4066,11 +4152,19 @@ fn taql_result_to_table(_py: Python<'_>, out: core::taql::TaqlTable) -> PyResult
     }
     let _ = wt.flush().map_err(err)?;
     let read = ::casacure::Table::open(&dir, false).map_err(err)?;
+    let disk_columns = read
+        .dat
+        .desc
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
     let shared = std::sync::Arc::new(std::sync::Mutex::new(WriteData {
         read,
         wt,
         dirty: false,
         pin: DirPin::new(&dir),
+        disk_columns,
         scratch: Some(scratch),
     }));
     register_write(&dir, &shared);
