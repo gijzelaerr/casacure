@@ -36,7 +36,16 @@ if [ -x .venv/bin/maturin ] && [ -x .venv/bin/python ]; then
     echo "== pre-push: maturin develop --release =="
     .venv/bin/maturin develop --release >/dev/null
     echo "== pre-push: pytest tests/ =="
-    PYTHONPATH=tests/shim .venv/bin/python -m pytest tests/ -q
+    # One full run writes ~3 GB of image round-trip tables through
+    # tmp_path; pytest's default temp root on a tmpfs /tmp fills the
+    # filesystem (it keeps the last three runs). A disk-backed --basetemp
+    # is wiped at the start of every run instead: bounded to one run,
+    # never accumulated (invoke release sets the same thing for its own
+    # push; this covers plain `git push`).
+    mkdir -p /var/tmp/pytest-gate
+    PYTHONPATH=tests/shim \
+    PYTEST_ADDOPTS="--basetemp=/var/tmp/pytest-gate${PYTEST_ADDOPTS:+ $PYTEST_ADDOPTS}" \
+        .venv/bin/python -m pytest tests/ -q
 fi
 
 echo "== pre-push: OK =="
