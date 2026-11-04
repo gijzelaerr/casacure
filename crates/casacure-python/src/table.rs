@@ -2666,11 +2666,15 @@ impl Table {
         let d = PyDict::new(py);
         for r in 0..nrow {
             let v = self.read_cell(col_idx, startrow + r)?;
-            if let RecordValue::Array(_) = v {
-                d.set_item(format!("r{}", r + 1), convert::cell_to_py(py, &v)?)?;
-            } else {
-                d.set_item(format!("r{}", r + 1), convert::cell_to_py(py, &v)?)?;
-            }
+            // python-casacore numbers the keys from row 0 of the table
+            // (`getvarcol("V", 1, 2)` -> r2, r3), not from the window's
+            // start. (The dict-form putcol/putvarcol input is a different
+            // convention: dask-ms builds {"r%d" % i} keys 0-based —
+            // conftest.py — so its "rN" means row N.)
+            d.set_item(
+                format!("r{}", startrow + r + 1),
+                convert::cell_to_py(py, &v)?,
+            )?;
         }
         Ok(d.into_any().unbind())
     }
@@ -2829,12 +2833,21 @@ impl Table {
             for (i, (row_offset, v)) in rows.into_iter().enumerate() {
                 let row = startrow + row_offset;
                 let desc = self.desc();
-                let is_array_col = matches!(
-                    desc.columns[col_idx].kind,
-                    core::tabledesc::ColumnKind::Array
-                );
+                let cd = &desc.columns[col_idx];
+                let is_array_col = matches!(cd.kind, core::tabledesc::ColumnKind::Array);
                 let mut cells = self.value_to_cells(py, col_idx, &v, 1, is_array_col, true)?;
                 let rec = cells.pop().unwrap_or(RecordValue::Int(0));
+                // A lone scalar is cast to the column's type like every
+                // other putcol element (a plain 99.0 into a float column
+                // stores as float, not rejected).
+                let rec = if matches!(cd.kind, core::tabledesc::ColumnKind::Scalar(_)) {
+                    match cd.data_type {
+                        core::record::DataType::Table | core::record::DataType::Record => rec,
+                        dt => convert::cast_scalar_to(&dt, &rec),
+                    }
+                } else {
+                    rec
+                };
                 self.put_cell(col_idx, row, rec)?;
                 let _ = i;
             }
