@@ -137,6 +137,28 @@ behaviour and against the materialising TaQL path by
 None currently. Unimplemented features and compatibility gaps are tracked in
 `ARE_WE_CURED.md`.
 
+## Unsupported storage managers fail at open with a named error
+
+casacure reads the storage managers that appear in mainstream MS output:
+`StandardStMan`, `IncrementalStMan`, and the tiled family
+`TiledColumnStMan` / `TiledShapeStMan` / `TiledCellStMan` (read and
+written). Two casacore managers are not implemented and fail at open with
+an error naming the manager, rather than a bare missing-file or generic
+message:
+
+- **`MemoryStMan`** — casacore's in-memory manager; it does not appear in
+  persistent table output, so there is no real-world file to develop
+  against. `storage error: unsupported data-manager type MemoryStMan`.
+- **`MultiFile`** (and MultiHDF5) — not a data manager but a container:
+  casacore packs every data manager's bytes into one `table.mf` /
+  `table.mfh5` file in the table directory (`ColumnSet.cc`), so the
+  per-manager files casacure mmaps (`table.f0`, …) do not exist.
+  `storage error: <dir> uses the unsupported MultiFile container
+  (table.mf) — casacure reads tables with per-manager data files only`.
+
+A real-world file that needs either one reopens the question, as with
+`TiledDataStMan` (`help wanted` on a fixture file, issue #18).
+
 ## Locking: casacore's protocol, with the yield checked at operation entry
 
 Not a divergence from the on-disk protocol — casacore's locking is

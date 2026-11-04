@@ -1211,6 +1211,21 @@ fn desc_equal_on_disk(a: &crate::tabledesc::TableDesc, b: &crate::tabledesc::Tab
 }
 
 fn read_table_dir(path: &std::path::Path) -> Result<DataFiles, TableDatError> {
+    // A MultiFile (or MultiHDF5) table keeps every data manager's bytes
+    // inside one `table.mf`/`table.mfh5` container (ColumnSet.cc), so the
+    // per-manager files this reader mmaps do not exist. Name the container
+    // instead of surfacing a bare missing-file os error about `table.f0`
+    // (issue #33).
+    for container in ["table.mf", "table.mfh5"] {
+        if path.join(container).is_file() {
+            return Err(TableDatError::Storage(format!(
+                "{} uses the unsupported MultiFile container ({}) — casacure \
+                 reads tables with per-manager data files only",
+                path.display(),
+                container
+            )));
+        }
+    }
     // Gated for reading: a same-process writer's patch/rewrite phases hold
     // the gate for writing, so an open never parses a half-written file
     // set (whole-file rewrites are atomic renames regardless).
