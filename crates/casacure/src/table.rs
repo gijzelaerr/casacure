@@ -705,19 +705,25 @@ fn build_ssm_data(
                         continue;
                     }
                     if cd.data_type == crate::record::DataType::String {
-                        // Multidim string arrays: the whole cell (shape
-                        // header + filled flag + length-prefixed strings) is
-                        // written into the string buckets as the cell's
-                        // content, referenced by a 12-byte (bucket, offset,
-                        // len) cell like a scalar variable string
-                        // (SSMStringHandler::put(Array<String>&, handleShape)).
+                        // Multidim string arrays: the whole cell is written
+                        // into the string buckets as the cell's content,
+                        // referenced by a 12-byte (bucket, offset, len)
+                        // cell like a scalar variable string
+                        // (SSMStringHandler::put(Array<String>&,
+                        // handleShape)). A variable-shape cell stores
+                        // `[ndim][dims][filled flag]` before the strings; a
+                        // fixed-shape one stores the strings only — casacore
+                        // (SSMDirColumn's string path) reconstructs the
+                        // shape from the column descriptor, so a header here
+                        // makes the column unreadable by casacore (#28).
                         let content =
-                            crate::ssm::encode_string_array_content(arr).map_err(|e| {
-                                TableCreateError::Io(std::io::Error::other(format!(
-                                    "encode {}.{}: {e}",
-                                    desc.name, cd.name
-                                )))
-                            })?;
+                            crate::ssm::encode_string_array_content(arr, cd.shape.as_deref())
+                                .map_err(|e| {
+                                    TableCreateError::Io(std::io::Error::other(format!(
+                                        "encode {}.{}: {e}",
+                                        desc.name, cd.name
+                                    )))
+                                })?;
                         let (bucket, offset) = str_buckets.put(&content);
                         has_strings = true;
                         let mut cell = vec![0u8; 12];
